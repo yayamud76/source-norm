@@ -1,0 +1,5 @@
+# Fixtures are checked out byte-for-byte. A test asserting on `${#arr}` or on a
+# `//` that must survive is asserting about BYTES, and autocrlf would hand
+# Windows a different file than the one the assertion was written against --
+# a fixture that changes on checkout is not a fixture.
+tests/fixtures/** -text

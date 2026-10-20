@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run tests (warnings are errors)
+        env:
+          PYTHONPATH: src
+        # -W is an INTERPRETER flag, so it precedes -m. Passed after it, it is
+        # argv for unittest's own CLI, which rejects it -- "unrecognized
+        # arguments: -W", exit 2, before a test runs, and the promotion never
+        # takes effect. The promotion is not decoration: its first execution
+        # against this suite reported two unclosed file handles in the lints.
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t tests -v
