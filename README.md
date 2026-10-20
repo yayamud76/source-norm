@@ -149,6 +149,36 @@ dropped `# A heading` as a comment and truncated the next line at a `#hash`,
 returning `'Some prose with a `'`. Markdown stays readable through `raw()`;
 `code()` raises, because a normaliser that changes meaning is worse than none.
 
+**A docstring's characters go; its lines stay.** Found by auditing this
+package after it was published. The stripper blanked whole *lines*, so anything
+sharing a line with a docstring went with it:
+
+```python
+code('"""module doc"""; FORBIDDEN_CALL()')   # -> ''
+code('def f(): """doc"""')                   # -> 'pass'
+```
+
+The first makes `assertNotIn("FORBIDDEN_CALL", code(src))` **pass with the call
+still in the file** — the precise false pass this package exists to stop,
+committed by the package. The second deletes a `def`. Both outputs still
+`ast.parse`, so the ratchet below could not see either, which is why the repair
+is pinned on content as well as on parseability. Removal is now by character
+range, re-indenting anything that followed a multi-line docstring's closing
+quotes and taking a stranded `;` with it.
+
+**A guard a caller can switch off by accident is not a guard.** The prose
+refusal was gated on `js is None`, so `code("notes.md", js=False)` walked past
+it and returned ``'Some prose with a `'`` — the corruption the guard was added
+for, reached through an unrelated argument. `js` chooses a stripper; it no
+longer decides whether the refusal applies. The shell path had the same gate,
+which sent `code("deploy.sh", js=False)` through the Python tokenizer.
+
+**`calls_to` named the enclosing function too, and repeated itself.**
+`ast.walk` descends through nested definitions, so a call inside an inner
+function was reported for its parent as well, and a function calling the target
+twice appeared twice — `['twice', 'twice', 'outer', 'inner']`, where `outer`
+makes no such call. The answer is the innermost function, once.
+
 **Normalised source must still parse.** The strongest form of the invariant, and
 a test, not an aspiration: normalisation may remove comments, never change the
 program.
@@ -196,7 +226,7 @@ rename changed all seven meanings at once — three began reading check fixtures
 |---|---|
 | `code(text_or_path, js=None, docstrings=False)` | Comments and docstrings removed. Language from the path suffix. Raises on prose, and on an existing file whose extension it cannot read. |
 | `raw(text_or_path)` | Everything. For assertions genuinely about the prose. |
-| `calls_to(name, text_or_path)` | Functions containing a call to `name`, by parsing. Matches `name(...)` and `obj.name(...)`. Python only. |
+| `calls_to(name, text_or_path)` | The **innermost** functions whose own body calls `name`, each listed once, by parsing. Matches `name(...)` and `obj.name(...)`. Python only. |
 | `is_check_file(path, prefixes=CHECK_PREFIXES)` | Check file vs production, spelled once. |
 | `production_py(root, prefixes=...)` / `check_py(root, ...)` | The two scopes, partitioning a directory's `.py` files. |
 | `READABLE_EXT` | Extensions opened as a path. Anything else one-line is literal source. |
@@ -211,7 +241,7 @@ containing a newline is literal source.
 PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -t tests -v
 ```
 
-42 tests. CI runs them on Linux and Windows across Python 3.9–3.13.
+46 tests. CI runs them on Linux and Windows across Python 3.9–3.13.
 
 The matrix is not decoration: it caught a defect this project's own author
 could not see locally. `_strip_docstrings` caught only `SyntaxError` from

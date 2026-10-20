@@ -68,6 +68,9 @@ __all__ = [
 _JSX_BLOCK = re.compile(r"\{/\*.*?\*/\}", re.S)
 _C_BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _TRAILING_SLASHES = re.compile(r"\s+//\s")
+#: A `;` left stranded where a docstring was removed. `"""d"""; x()` must not
+#: normalise to `; x()`, which is a SyntaxError.
+_LEADING_SEMI = re.compile(r"^\s*;\s*")
 
 _JS_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
 
@@ -195,29 +198,56 @@ def _strip_docstrings(text):
             # `only` = the docstring is the entire body, so removing it needs a
             # `pass` in its place rather than blank lines.
             only = len(body) == 1 and not isinstance(node, ast.Module)
-            spans.append((first.lineno, first.end_lineno, only))
+            spans.append((first.lineno, first.end_lineno or first.lineno, only,
+                          first.col_offset, first.end_col_offset))
     if not spans:
         return text
     # A docstring that is a body's ONLY statement cannot simply be blanked --
     # that leaves `def f():` with no block and the result no longer parses.
     # Caught by this module's own ratchet (normalised source must still
     # ast.parse), which is the whole reason that test exists.
-    kill, stub = {}, {}
-    for a, b, only in spans:
-        for i in range(a, (b or a) + 1):
-            kill[i] = True
-        if only:
-            stub[a] = True
-    out = []
-    for i, line in enumerate(text.splitlines(), 1):
-        if i not in kill:
-            out.append(line)
-        elif i in stub:
-            indent = line[:len(line) - len(line.lstrip())]
-            out.append(f"{indent}pass")
+    #
+    # AND IT IS THE CHARACTERS THAT GO, NOT THE LINES. Blanking whole lines
+    # deleted anything that SHARED a line with a docstring, which is this
+    # module's cardinal sin -- output that still looks like source. Measured:
+    #
+    #     '"""module doc"""; FORBIDDEN_CALL()'   ->  ''
+    #     'def f(): """doc"""'                   ->  'pass'
+    #
+    # The first makes `assertNotIn("FORBIDDEN_CALL", code(src))` pass with the
+    # call still in the file -- the exact false pass this package exists to
+    # stop, committed by the package. The second deletes a `def`. Both results
+    # still ast.parse, so the ratchet could not see either.
+    lines = text.splitlines()
+
+    def _indent(line):
+        return line[:len(line) - len(line.lstrip())]
+
+    # Descending, so an earlier edit never shifts a later span's columns.
+    for a, b, only, c0, c1 in sorted(spans, reverse=True):
+        head = lines[a - 1][:c0]
+        tail = lines[b - 1][c1:]
+        # A docstring followed by `;` leaves a statement separator with nothing
+        # in front of it, which does not parse. It goes with the docstring.
+        tail = _LEADING_SEMI.sub("", tail, count=1)
+        if b > a:
+            for i in range(a + 1, b):
+                lines[i - 1] = ""
+            # Code after a MULTI-LINE docstring's closing quotes has to be
+            # re-indented to the statement's own column -- it sat mid-line
+            # before, and leaving it at column 0 turns a corruption into a
+            # SyntaxError. `c0` is where the docstring statement began, so it
+            # is where its successor on that line belongs.
+            lines[b - 1] = (" " * c0) + tail.lstrip() if tail.strip() else ""
+            tail = ""
+        rest = head + tail
+        if only and not rest.strip():
+            lines[a - 1] = _indent(lines[a - 1]) + "pass"
+        elif only:
+            lines[a - 1] = rest.rstrip() + " pass"
         else:
-            out.append("")
-    return "\n".join(out)
+            lines[a - 1] = rest.rstrip() if rest.strip() else ""
+    return "\n".join(lines)
 
 
 def code(text_or_path, js=None, docstrings=False):
@@ -235,15 +265,23 @@ def code(text_or_path, js=None, docstrings=False):
     the program. If the question is "does this code USE x", that is a parse:
     `calls_to()`, or `ast` directly.
     """
-    if js is None and _is_prose(text_or_path):
+    # NOT gated on `js`. The refusal is about the TARGET being prose, and
+    # gating it meant `code("notes.md", js=False)` walked straight past it and
+    # returned 'Some prose with a `' -- the corruption this guard was added
+    # for, reachable through an unrelated argument.
+    if _is_prose(text_or_path):
         raise ValueError(
             f"{text_or_path!r} is prose, not code. Normalising it would corrupt "
             f"it -- markdown's `#` is a heading and its `//` is text. Use raw() "
             f"for a prose file; code() is for source.")
     text = _read(text_or_path)
-    if js is None and _is_shell(text_or_path):
-        return _strip_shell_comments(text)
     as_js = _is_js(text_or_path) if js is None else bool(js)
+    if not as_js and _is_shell(text_or_path):
+        # Shell unless JS was asked for EXPLICITLY. Gating this on `js is None`
+        # sent `code("deploy.sh", js=False)` through the Python tokenizer,
+        # which raises on shell and falls back to the naive `  # ` split the
+        # tokenizer path exists to replace.
+        return _strip_shell_comments(text)
     if not as_js:
         out = _strip_python_comments(text)
         # Docstrings go by DEFAULT. Pass docstrings=True only for an assertion
@@ -280,14 +318,32 @@ def calls_to(name, text_or_path):
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        for node in ast.walk(fn):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == name):
-                found.append(fn.name)
-            elif (isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute)
-                  and node.func.attr == name):
-                found.append(fn.name)
+        # The INNERMOST enclosing function, and each one ONCE. `ast.walk`
+        # descends through nested definitions, so a call inside an inner
+        # function was reported for the outer one too, and a function calling
+        # `name` twice was listed twice:
+        #
+        #     def twice(): target(); target()      -> ['twice', 'twice', ...]
+        #     def outer():
+        #         def inner(): target()            -> [..., 'outer', 'inner']
+        #
+        # "Functions containing a call" means the function whose body holds
+        # it; `outer` does not call `name`, and a README example asserting
+        # equality against a one-element list cannot survive either artefact.
+        stack, hit = list(fn.body), False
+        while stack and not hit:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.Lambda)):
+                continue                  # belongs to that function, not this
+            if isinstance(node, ast.Call):
+                f = node.func
+                if ((isinstance(f, ast.Name) and f.id == name)
+                        or (isinstance(f, ast.Attribute) and f.attr == name)):
+                    hit = True
+            stack.extend(ast.iter_child_nodes(node))
+        if hit and fn.name not in found:
+            found.append(fn.name)
     return found
 
 

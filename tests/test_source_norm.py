@@ -462,6 +462,99 @@ class Scope(unittest.TestCase):
         # the Python side, for contrast: a `#` inside a string is untouched
         self.assertEqual(sn.code('p = "# not a comment"'), 'p = "# not a comment"')
 
+    def test_a_DOCSTRING_takes_ITS_CHARACTERS_not_ITS_LINES(self):
+        """Nothing that merely SHARES a line with a docstring is removed.
+
+        The stripper blanked whole lines, so anything on a docstring's first or
+        last line went with it -- this package's cardinal sin, output that
+        still looks like source. Measured before the fix:
+
+            '\"\"\"module doc\"\"\"; FORBIDDEN_CALL()'   ->  ''
+            'def f(): \"\"\"doc\"\"\"'                   ->  'pass'
+
+        The first makes `assertNotIn("FORBIDDEN_CALL", code(src))` pass with
+        the call still in the file, which is the false pass this package exists
+        to stop. Both outputs still ast.parse, so the normalised-source-parses
+        ratchet could not see either -- which is why this is pinned on CONTENT
+        as well as on parseability.
+        """
+        cases = [
+            ('"""module doc"""; FORBIDDEN_CALL()\ndef f():\n    pass\n',
+             ["FORBIDDEN_CALL"]),
+            ('def f(): """doc"""\ndef g(): FORBIDDEN_CALL()\n',
+             ["def f()", "FORBIDDEN_CALL"]),
+            ('class C: """doc"""\n', ["class C"]),
+            ('def f():\n    """a\n    b"""; KEEP_ME()\n', ["KEEP_ME"]),
+            ('class C:\n    def m(self):\n        """a\n        b"""; KEEP()\n'
+             '        return 1\n', ["KEEP", "return 1"]),
+        ]
+        for src, must_survive in cases:
+            out = sn.code(src)
+            ast.parse(out)                 # normalisation never breaks syntax
+            for token in must_survive:
+                self.assertIn(token, out,
+                              f"{token!r} shared a line with a docstring and "
+                              f"was deleted with it:\n{out!r}")
+            self.assertNotIn("doc", out.replace("docstring", ""),
+                             "the docstring itself must still be gone")
+
+    def test_calls_to_names_the_INNERMOST_function_ONCE(self):
+        """One entry per function whose own body holds the call.
+
+        `ast.walk` descends through nested definitions, so a call inside an
+        inner function was reported for the enclosing one too, and a function
+        calling it twice was listed twice:
+
+            ['twice', 'twice', 'outer', 'inner']
+
+        `outer` does not call it. A README example asserting equality against a
+        one-element list survives neither artefact.
+        """
+        src = ("def twice():\n    target()\n    target()\n"
+               "def outer():\n    def inner():\n        target()\n"
+               "def attr():\n    obj.target()\n"
+               "def never():\n    other()\n")
+        got = sn.calls_to("target", src)
+        self.assertEqual(sorted(got), ["attr", "inner", "twice"])
+        self.assertEqual(len(got), len(set(got)), f"repeated entries: {got}")
+        self.assertNotIn("outer", got,
+                         "the call is in `inner`; `outer` does not make it")
+        self.assertNotIn("never", got)
+
+    def test_the_PROSE_REFUSAL_is_not_reachable_PAST(self):
+        """`js` chooses a stripper; it does not switch the refusal off.
+
+        Gating the prose check on `js is None` meant `code("notes.md",
+        js=False)` walked straight past it and returned 'Some prose with a `' --
+        the corruption the guard was added for, reached through an unrelated
+        argument. A guard a caller can disable by accident is not a guard.
+        """
+        d = tempfile.mkdtemp()
+        md = os.path.join(d, "notes.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write("# A heading\nSome prose with a `#hash` and // slashes\n")
+        for kwargs in ({}, {"js": False}, {"js": True}):
+            with self.assertRaises(ValueError, msg=f"js={kwargs}"):
+                sn.code(md, **kwargs)
+        self.assertIn("# A heading", sn.raw(md))
+
+    def test_SHELL_stays_shell_unless_JS_is_asked_for_EXPLICITLY(self):
+        """`code("deploy.sh", js=False)` must not run the Python tokenizer.
+
+        That gate was also `js is None`, so an explicit js=False sent shell
+        source through `tokenize`, which raises on it and falls back to the
+        naive `  # ` split the tokenizer path exists to replace.
+        """
+        d = tempfile.mkdtemp()
+        sh = os.path.join(d, "deploy.sh")
+        with open(sh, "w", encoding="utf-8") as f:
+            f.write('echo "a  # not a comment"  # real\nx=${#arr}\n')
+        for kwargs in ({}, {"js": False}):
+            out = sn.code(sh, **kwargs)
+            self.assertIn("a  # not a comment", out, f"js={kwargs}")
+            self.assertIn("${#arr}", out, f"js={kwargs}")
+            self.assertNotIn("# real", out, f"js={kwargs}")
+
     def test_PROSE_is_refused_rather_than_corrupted(self):
         """Found while writing this package's README. `code("notes.md")` dropped
         `# A heading` as a Python comment and truncated the next line at a
