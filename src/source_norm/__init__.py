@@ -163,7 +163,23 @@ def _strip_docstrings(text):
     """
     try:
         tree = ast.parse(text)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
+        # ValueError belongs here and was missing, which CI caught on 3.9 and
+        # 3.10 while 3.11-3.13 passed. `ast.parse` rejects source holding a NUL
+        # byte with ValueError up to 3.10 and SyntaxError from 3.11 on:
+        #
+        #     ast.parse("x\0y")   3.9  -> ValueError
+        #                         3.10 -> ValueError
+        #                         3.11 -> SyntaxError
+        #                         3.12 -> SyntaxError
+        #                         3.13 -> SyntaxError
+        #
+        # so on the two oldest supported versions the exception escaped
+        # `code()` entirely. `_strip_python_comments` above already catches
+        # ValueError; this sibling did not. Two functions guarding the same
+        # parse hazard with different except tuples is the one-of-them-quietly-
+        # loses-a-step defect this module is otherwise about, and a normaliser
+        # must never be the reason a test cannot run.
         return text
     spans = []
     for node in ast.walk(tree):

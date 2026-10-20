@@ -11,7 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest was here and is deliberately gone. Across three runs
+        # and two repositories, ALL FIFTEEN macOS jobs reported `cancelled`
+        # with zero steps ever started -- no runner was allocated to this
+        # account, ~25 minutes each time. A matrix entry that never executes
+        # reds the badge while proving nothing, which makes it a coverage claim
+        # with no alarm on it. windows-latest, by contrast, allocates and runs,
+        # and it caught the 3.9/3.10 ValueError alongside ubuntu. Re-add macOS
+        # the day a run allocates, and let that run be the evidence.
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4

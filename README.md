@@ -211,7 +211,19 @@ containing a newline is literal source.
 PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -t tests -v
 ```
 
-42 tests. CI runs them on Linux, macOS and Windows across Python 3.9–3.13.
+42 tests. CI runs them on Linux and Windows across Python 3.9–3.13.
+
+The matrix is not decoration: it caught a defect this project's own author
+could not see locally. `_strip_docstrings` caught only `SyntaxError` from
+`ast.parse`, but source holding a NUL byte raises **`ValueError` on 3.9 and
+3.10** and `SyntaxError` only from 3.11 on — so on the two oldest supported
+versions the exception escaped `code()` entirely. It failed on 3.9 and 3.10, on
+both operating systems, and passed on 3.11–3.13.
+
+**macOS is not verified here.** The matrix asked for it and GitHub never
+allocated a runner: across three runs, all fifteen macOS jobs were cancelled
+after ~25 minutes with zero steps started. The claim now matches what
+executed.
 
 `ResourceWarning` is promoted to an error, and it is not decoration: its first
 execution against this suite reported two unclosed file handles in the lints
